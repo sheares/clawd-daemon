@@ -25,7 +25,7 @@ import sys
 import time
 from collections import deque
 from datetime import date, datetime
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 from bleak import BleakClient, BleakScanner
 
 DEVICE_NAME = "AtomS3R-Notify"
@@ -36,6 +36,11 @@ PORT        = 8765
 RAPID_WINDOW_S   = 30
 RAPID_THRESHOLD  = 10
 RAPID_COOLDOWN_S = 60
+
+# Health probe: macOS sleep can tear down BLE silently, leaving _client.is_connected
+# stuck at True. A periodic write-with-response forces the OS to detect the dead link.
+HEALTH_CHECK_S    = 60
+HEALTH_PROBE_TO_S = 3.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,7 +66,7 @@ _session_labels: dict[str, str]   = {}
 _last_bar_payload:    str = ""
 _last_face_state:     str = ""
 _last_labels_payload: str = ""
-SESSION_TTL_S = 5 * 60
+SESSION_TTL_S = 30 * 60
 MAX_SLOTS     = 4
 LCD_WIDTH     = 128
 CHAR_PX_BIG   = 6      # 5x8 font + 1px spacing (used at 1-2 slots)
@@ -138,9 +143,11 @@ async def _connect_loop() -> None:
             await client.connect()
             _client = client
             log.info("connected to %s (%s)", DEVICE_NAME, device.address)
-            # Push today's theme + current hour on connect
+            # Push today's theme + current hour + last-known weather on connect
             await _push_theme()
             await _push_time()
+            if _last_weather:
+                await _send(f"weather {_last_weather}")
             # Force a re-broadcast of bar + labels + face so reconnects refresh state.
             global _last_bar_payload, _last_face_state, _last_labels_payload
             _last_bar_payload = ""
@@ -308,6 +315,34 @@ async def _push_time() -> None:
     await _send(f"time {datetime.now().hour}")
 
 
+async def _health_check_loop() -> None:
+    """Probe the BLE link every HEALTH_CHECK_S; force reconnect on silent failure."""
+    global _client
+    while True:
+        await asyncio.sleep(HEALTH_CHECK_S)
+        client = _client
+        if client is None:
+            continue
+        if not client.is_connected:
+            log.warning("health: is_connected==False, kicking reconnect")
+            _client = None
+            asyncio.create_task(_connect_loop())
+            continue
+        try:
+            await asyncio.wait_for(
+                client.write_gatt_char(NUS_RX_UUID, b"ping", response=True),
+                timeout=HEALTH_PROBE_TO_S,
+            )
+        except Exception as exc:
+            log.warning("health probe failed (%s) — forcing reconnect", exc)
+            _client = None
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            asyncio.create_task(_connect_loop())
+
+
 async def _hourly_time_pusher() -> None:
     """Re-push current hour shortly after each hour ticks over."""
     while True:
@@ -317,6 +352,62 @@ async def _hourly_time_pusher() -> None:
         seconds_until_next_hour = 3600 - (now.minute * 60 + now.second) + 30
         await asyncio.sleep(seconds_until_next_hour)
         await _push_time()
+
+
+# ─── Weather poller (Open-Meteo, Singapore) ───────────────────────────────────
+
+# Singapore coordinates for the Open-Meteo current-weather query.
+SG_LAT = 1.3521
+SG_LON = 103.8198
+WEATHER_POLL_S = 600   # 10 min
+
+_last_weather: str = ""
+
+def _wmo_to_code(wmo: int) -> str:
+    """Open-Meteo WMO weather code → firmware's 6-code vocabulary."""
+    if wmo == 0:                      return "clear"
+    if wmo in (1, 2, 3):              return "clouds"   # mainly clear/partly/overcast
+    if wmo in (45, 48):               return "fog"
+    if 51 <= wmo <= 67:               return "rain"     # drizzle + rain
+    if 80 <= wmo <= 82:               return "rain"     # rain showers
+    if 71 <= wmo <= 77:               return "snow"
+    if wmo in (85, 86):               return "snow"
+    if wmo == 95 or wmo in (96, 99):  return "thunder"
+    return "clouds"   # fallback
+
+
+async def _fetch_weather_once() -> str | None:
+    """One Open-Meteo poll → returns our 6-code string, or None on error."""
+    url = (f"https://api.open-meteo.com/v1/forecast"
+           f"?latitude={SG_LAT}&longitude={SG_LON}&current=weather_code")
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=8)) as s:
+            async with s.get(url) as resp:
+                if resp.status != 200:
+                    log.warning("weather: HTTP %d", resp.status)
+                    return None
+                data = await resp.json()
+        wmo = int(data.get("current", {}).get("weather_code", -1))
+        if wmo < 0:
+            return None
+        return _wmo_to_code(wmo)
+    except Exception as exc:
+        log.warning("weather: fetch failed: %s", exc)
+        return None
+
+
+async def _weather_poller() -> None:
+    """Poll Open-Meteo every 10 min; push `weather <code>` on change."""
+    global _last_weather
+    # Initial delay so we don't race against BLE connect on startup.
+    await asyncio.sleep(15)
+    while True:
+        code = await _fetch_weather_once()
+        if code and code != _last_weather:
+            _last_weather = code
+            log.info("weather → %s", code)
+            await _send(f"weather {code}")
+        await asyncio.sleep(WEATHER_POLL_S)
 
 
 # ─── HTTP handlers ────────────────────────────────────────────────────────────
@@ -377,6 +468,34 @@ async def handle_clear(req: web.Request) -> web.Response:
     return web.Response(text="OK\n")
 
 
+async def handle_end(req: web.Request) -> web.Response:
+    # Called from Claude Code's SessionEnd hook. Immediately evicts the session
+    # so its strip disappears from Clawd without waiting for SESSION_TTL_S.
+    sid = _sid(req)
+    if not sid:
+        return web.Response(status=400, text="missing session_id\n")
+    _session_seen.pop(sid, None)
+    _session_states.pop(sid, None)
+    _session_slots.pop(sid, None)
+    _session_labels.pop(sid, None)
+    await _broadcast_session_view()
+    return web.Response(text=f"OK ended={sid}\n")
+
+
+async def handle_reset(req: web.Request) -> web.Response:
+    # User-triggered "reset clawd" — wipe ALL per-session state so Clawd returns
+    # to env mode with an empty bar. Firmware also clears its slot_order/drag
+    # state when sessions_count drops.
+    n_cleared = len(_session_seen)
+    _session_seen.clear()
+    _session_states.clear()
+    _session_slots.clear()
+    _session_labels.clear()
+    await _broadcast_session_view()
+    await _send("standby")
+    return web.Response(text=f"OK reset (cleared {n_cleared} sessions)\n")
+
+
 async def handle_theme(req: web.Request) -> web.Response:
     name = req.match_info.get("name", "default")
     # Whitelist to avoid junk reaching firmware parser
@@ -385,6 +504,57 @@ async def handle_theme(req: web.Request) -> web.Response:
         return web.Response(status=400, text=f"unknown theme: {name}\n")
     await _send(f"theme {name}")
     return web.Response(text=f"OK theme={name}\n")
+
+
+async def handle_mug(req: web.Request) -> web.Response:
+    """Force a specific cup design for visual iteration.
+    Spec is `<brand>` (random form) or `<brand>-<form>` (ceramic|cup), or `auto`.
+    """
+    spec = req.match_info.get("spec", "").lower()
+    table = {
+        "auto":          "-1 -1",
+        "starbucks":     "-1 0",
+        "luckin":        "-1 1",
+        "chagee":        "-1 2",
+        "starbucks-mug": "0 0",
+        "luckin-mug":    "0 1",
+        "chagee-mug":    "0 2",
+        "starbucks-cup": "2 0",
+        "luckin-cup":    "2 1",
+        "chagee-cup":    "2 2",
+    }
+    if spec not in table:
+        return web.Response(status=400, text=f"unknown mug spec: {spec}\n")
+    await _send(f"mug {table[spec]}")
+    return web.Response(text=f"OK mug={spec}\n")
+
+
+async def handle_weather(req: web.Request) -> web.Response:
+    # Manual weather override for visual iteration. Real auto-fetch from
+    # Open-Meteo lives in _weather_poller (added later); this endpoint stays
+    # for debugging.
+    code = req.match_info.get("code", "")
+    allowed = {"clear", "clouds", "rain", "thunder", "snow", "fog"}
+    if code not in allowed:
+        return web.Response(status=400, text=f"unknown weather: {code}\n")
+    await _send(f"weather {code}")
+    return web.Response(text=f"OK weather={code}\n")
+
+
+async def handle_emote(req: web.Request) -> web.Response:
+    # Direct emotion trigger — bypasses session state, fires `emote <name>` on the
+    # firmware. Used for visual iteration on emotion designs.
+    name = req.match_info.get("name", "")
+    allowed = {"idle", "happy", "sleepy", "surprised", "waving",
+               "sad", "angry", "confused", "dizzy", "loving", "clock",
+               "thinking", "waiting", "done",
+               "embarrassed", "smug", "focused", "scared", "mindblown",
+               "dance",
+               "nod", "shake", "stretch"}
+    if name not in allowed:
+        return web.Response(status=400, text=f"unknown emote: {name}\n")
+    await _send(f"emote {name}")
+    return web.Response(text=f"OK emote={name}\n")
 
 
 # Map raw Claude Code tool names to the short tokens the firmware parses.
@@ -410,14 +580,22 @@ _TOOL_ALIAS = {
 
 async def handle_tool(req: web.Request) -> web.Response:
     # Tool calls just refresh seen-time; they don't change the bar state.
-    await _set_session_state(_sid(req), None, _label(req))
+    sid = _sid(req)
+    await _set_session_state(sid, None, _label(req))
     name = req.match_info.get("name", "").strip().lower()
     if not name:
         await _send("tool")  # clear
         return web.Response(text="OK tool=(clear)\n")
     token = _TOOL_ALIAS.get(name, "other")
-    await _send(f"tool {token}")
-    return web.Response(text=f"OK tool={token}\n")
+    # Include the session's bar slot index so the firmware can attribute the
+    # tool name to the correct session strip. Older firmware ignores the
+    # leading digit and treats the whole arg as the tool name (graceful fallback).
+    slot = _session_slots.get(sid) if sid else None
+    if slot is not None:
+        await _send(f"tool {slot} {token}")
+    else:
+        await _send(f"tool {token}")
+    return web.Response(text=f"OK tool={token} slot={slot}\n")
 
 
 async def handle_tool_clear(req: web.Request) -> web.Response:
@@ -460,14 +638,20 @@ async def main() -> None:
     global _loop
     _loop = asyncio.get_running_loop()
 
-    await _connect_loop()
-
+    # HTTP server starts FIRST so endpoints respond even while Clawd is offline.
+    # BLE connect runs as a background task that retries until the device appears;
+    # _send() no-ops (with a warning log) when the client isn't connected yet.
     app = web.Application()
     app.router.add_get("/thinking",     handle_thinking)
     app.router.add_get("/question",     handle_question)
     app.router.add_get("/notify",       handle_notify)
     app.router.add_get("/clear",        handle_clear)
+    app.router.add_get("/end",          handle_end)
+    app.router.add_get("/reset",        handle_reset)
     app.router.add_get("/theme/{name}", handle_theme)
+    app.router.add_get("/emote/{name}", handle_emote)
+    app.router.add_get("/weather/{code}", handle_weather)
+    app.router.add_get("/mug/{spec}",     handle_mug)
     app.router.add_get("/tool/{name}",  handle_tool)
     app.router.add_get("/tool",         handle_tool_clear)
     app.router.add_get("/time/{hh}",    handle_time)
@@ -482,6 +666,9 @@ async def main() -> None:
 
     asyncio.create_task(_hourly_time_pusher())
     asyncio.create_task(_session_evictor())
+    asyncio.create_task(_weather_poller())
+    asyncio.create_task(_health_check_loop())
+    asyncio.create_task(_connect_loop())
 
     await asyncio.Event().wait()
 
