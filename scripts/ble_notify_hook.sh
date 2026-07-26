@@ -27,6 +27,37 @@ DEFAULT_LABEL=$(basename "$CWD" | tr -cd 'A-Za-z0-9_ -')
 TOPIC_FILE=""
 [ -n "$S" ] && TOPIC_FILE="/tmp/clawd_topic.$S"
 
+# Goodbye sentinel — set by the "logging out" / "good night clawd" / etc.
+# easter egg below. While it exists, every hook for this sid except a real
+# UserPromptSubmit or SessionEnd exits silently so Claude's reply text and
+# memory writes can't flicker the monitor strip back on after the wave/sleepy
+# farewell. The sentinel auto-clears on:
+#   - The next user prompt arriving on this sid (user came back).
+#   - SessionEnd firing (session truly closed).
+GOODBYE_FILE=""
+[ -n "$S" ] && GOODBYE_FILE="/tmp/clawd_goodbye.$S"
+if [ -n "$GOODBYE_FILE" ] && [ -f "$GOODBYE_FILE" ]; then
+    case "$ENDPOINT" in
+        end)
+            # SessionEnd: clear sentinel + topic, then continue to /end logic.
+            rm -f "$GOODBYE_FILE"
+            ;;
+        thinking)
+            # Only an actual UserPromptSubmit carries a .prompt — PostToolUse
+            # also fires `thinking` but has no .prompt and must stay silenced.
+            _PROMPT_PEEK=$(printf '%s' "$J" | jq -r '.prompt // empty' 2>/dev/null || true)
+            if [ -n "$_PROMPT_PEEK" ]; then
+                rm -f "$GOODBYE_FILE"
+            else
+                exit 0
+            fi
+            ;;
+        *)
+            exit 0
+            ;;
+    esac
+fi
+
 # Topic detection — explicit only. Looks for any of these trigger phrases
 # in the user's prompt and uses the next 1-3 meaningful words as the new
 # label. Sticky in /tmp/clawd_topic.<sid>.
@@ -38,7 +69,7 @@ if [ "$ENDPOINT" = "thinking" ] && [ -n "$TOPIC_FILE" ]; then
     if [ -n "$PROMPT" ]; then
         NEW_TOPIC=$(printf '%s' "$PROMPT" | awk '
         BEGIN {
-            n_trigs = 10
+            n_trigs = 11
             TRIGS[1] = "change session name to"
             TRIGS[2] = "change the session name to"
             TRIGS[3] = "change this session name to"
@@ -48,10 +79,14 @@ if [ "$ENDPOINT" = "thinking" ] && [ -n "$TOPIC_FILE" ]; then
             TRIGS[7] = "set session name to"
             TRIGS[8] = "set the session name to"
             TRIGS[9] = "set this session name to"
-            # Bare fragment — must come last in the array because longer
-            # triggers containing this substring should win (best-pos logic
-            # also picks longer-match on tie).
+            # Bare fragment — must come last of the "session name" family.
             TRIGS[10] = "session name to"
+            # Slash-command form. Only fires when the /rename slash command
+            # is submitted as normal prompt text (e.g. via `/btw /rename ws`).
+            # The real built-in /rename dispatched directly does NOT fire the
+            # UserPromptSubmit hook, so typing `/rename ws` alone will not
+            # match this trigger.
+            TRIGS[11] = "/rename "
             # Words that should end the topic capture (politeness tail-words)
             STOP["please"]=1; STOP["thanks"]=1; STOP["thank"]=1
             STOP["now"]=1; STOP["then"]=1; STOP["ok"]=1; STOP["okay"]=1
@@ -74,8 +109,11 @@ if [ "$ENDPOINT" = "thinking" ] && [ -n "$TOPIC_FILE" ]; then
             }
             if (best_pos == 0) exit
             rest = substr(buf, best_pos + best_len)
-            # Cut at first sentence-terminator
-            sub(/[.!?].*/, "", rest)
+            # Cut at first sentence-terminator or "(". The "(" catches the
+            # /btw skill boilerplate aside — e.g. `/btw /rename ws\n\n
+            # (Just acknowledge in one short sentence...)` should yield just
+            # "WS", not "WS-JUST-ACKN".
+            sub(/[.!?(].*/, "", rest)
             n = split(rest, words, /[ \t\n\r,;:()\[\]{}"]+/)
             out = ""; count = 0
             for (i = 1; i <= n && count < 3; i++) {
@@ -109,14 +147,47 @@ if [ "$ENDPOINT" = "thinking" ] && [ -n "$TOPIC_FILE" ]; then
         # ── Easter egg phrases — fire emotes via daemon /emote/<name>.
         # First match wins (elif chain). Curl in background where the emote is
         # multi-step so the hook returns immediately and doesn't slow Claude.
-        if printf '%s' "$PROMPT" | grep -qiE 'good ?night clawd'; then
-            curl -s --max-time 2 "http://127.0.0.1:8765/emote/sleepy" > /dev/null 2>&1 || true
-        elif printf '%s' "$PROMPT" | grep -qiE '(good )?morning clawd'; then
-            # Happy first, then waving 2 s later (background so hook returns fast).
+        # Fuzzy matching via grep -qiE; word boundaries (\b) on short or
+        # ambiguous triggers to avoid false positives inside other words.
+        if printf '%s' "$PROMPT" | grep -qiE "good ?night clawd|log(ging)? (out|off)|going to bed|signing (off|out)|bye clawd|see you (tomorrow|later) clawd"; then
+            # Goodbye: wave first, drift to sleep, then evict this session from
+            # the daemon so its monitor strip vanishes once the sleepy beat has
+            # played out. Sentinel file silences subsequent reply/tool hooks
+            # for the same sid so Claude's farewell + memory writes don't
+            # flicker the strip back on. Sentinel is cleared by SessionEnd or
+            # the next user prompt (see top-of-script guard above).
+            curl -s --max-time 2 "http://127.0.0.1:8765/emote/waving" > /dev/null 2>&1 || true
+            # Mid-farewell flip — somersault before the sleepy drift
+            ( sleep 2; curl -s --max-time 2 "http://127.0.0.1:8765/emote/flip" > /dev/null 2>&1 ) &
+            ( sleep 3; curl -s --max-time 2 "http://127.0.0.1:8765/emote/sleepy" > /dev/null 2>&1 ) &
+            if [ -n "$S" ]; then
+                touch "/tmp/clawd_goodbye.$S"
+                (
+                    # Wave (t=0) → flip (t=2) → sleepy (t=3) → evict (t=7)
+                    sleep 7
+                    curl -s -G --max-time 2 --data-urlencode "session_id=$S" \
+                        "http://127.0.0.1:8765/end" > /dev/null 2>&1
+                    rm -f "/tmp/clawd_topic.$S" 2>/dev/null
+                    # Keep the goodbye sentinel until SessionEnd / next prompt
+                    # so reply + memory hooks stay silenced even past +6s.
+                ) &
+            fi
+        elif printf '%s' "$PROMPT" | grep -qiE "(good )?morning clawd|i'?m back|i am back|i'?m home"; then
+            # Hello: happy hop, then wave
             curl -s --max-time 2 "http://127.0.0.1:8765/emote/happy" > /dev/null 2>&1 || true
             ( sleep 2; curl -s --max-time 2 "http://127.0.0.1:8765/emote/waving" > /dev/null 2>&1 ) &
-        elif printf '%s' "$PROMPT" | grep -qiE '(i )?love you clawd'; then
+        elif printf '%s' "$PROMPT" | grep -qiE "(i )?love you clawd"; then
             curl -s --max-time 2 "http://127.0.0.1:8765/emote/loving" > /dev/null 2>&1 || true
+        elif printf '%s' "$PROMPT" | grep -qiE "thanks clawd|thank you clawd|good job clawd|nice work clawd|well done clawd"; then
+            curl -s --max-time 2 "http://127.0.0.1:8765/emote/happy" > /dev/null 2>&1 || true
+        elif printf '%s' "$PROMPT" | grep -qiE "ship it|let'?s commit|let'?s ship|shipping it"; then
+            curl -s --max-time 2 "http://127.0.0.1:8765/emote/done" > /dev/null 2>&1 || true
+        elif printf '%s' "$PROMPT" | grep -qiE "\bbrb\b|lunch break|coffee break|be right back|taking a break"; then
+            curl -s --max-time 2 "http://127.0.0.1:8765/emote/tea" > /dev/null 2>&1 || true
+        elif printf '%s' "$PROMPT" | grep -qiE "\bwow\b|amazing|mind blown|\bperfect\b"; then
+            curl -s --max-time 2 "http://127.0.0.1:8765/emote/mindblown" > /dev/null 2>&1 || true
+        elif printf '%s' "$PROMPT" | grep -qiE "\bugh\b|i'?m stuck|this is broken|\bfml\b"; then
+            curl -s --max-time 2 "http://127.0.0.1:8765/emote/sad" > /dev/null 2>&1 || true
         elif printf '%s' "$PROMPT" | grep -qiw 'dance'; then
             curl -s --max-time 2 "http://127.0.0.1:8765/emote/dance" > /dev/null 2>&1 || true
         fi

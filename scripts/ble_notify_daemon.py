@@ -19,12 +19,14 @@ Side effects:
 """
 
 import asyncio
+import json
 import logging
 import re
 import sys
 import time
 from collections import deque
 from datetime import date, datetime
+from pathlib import Path
 from aiohttp import web, ClientSession, ClientTimeout
 from bleak import BleakClient, BleakScanner
 
@@ -298,7 +300,17 @@ async def _set_session_state(
             _alloc_slot(session_id)
             _session_states[session_id] = state
         if label:
-            _session_labels[session_id] = label[:LABEL_HARD_MAX]
+            new_label = label[:LABEL_HARD_MAX]
+            prev_label = _session_labels.get(session_id, "")
+            # Panel-swap animation: when an existing session's label actually
+            # changes (e.g. user typed "change session name to X"), tell the
+            # firmware to play the swap animation on that slot BEFORE the new
+            # labels broadcast arrives.
+            if (prev_label and prev_label != new_label
+                    and session_id in _session_slots):
+                slot = _session_slots[session_id]
+                await _send(f"labelswap {slot}")
+            _session_labels[session_id] = new_label
     _evict_old_sessions()
     await _broadcast_session_view()
 
@@ -309,6 +321,72 @@ async def _session_evictor() -> None:
         await asyncio.sleep(30)
         _evict_old_sessions()
         await _broadcast_session_view()
+
+
+# ─── CLI /rename → Clawd label mirror ────────────────────────────────────────
+# Claude Code's built-in /rename command doesn't fire any hook we can intercept
+# — but it does persist the new name to ~/.claude/sessions/<pid>.json. Polling
+# those files lets us mirror /rename onto the Clawd bar with ≈CLI_WATCH_INTERVAL_S
+# lag, no CLI cooperation required.
+#
+# Normalisation matches the (now-removed) /session skill helper: alnum + hyphen,
+# up to 3 tokens, upper, ≤12 chars. This is intentionally the same rule as the
+# hook-side topic detection so labels look identical regardless of which path
+# set them.
+#
+# On daemon startup we do a priming pass that seeds the cache without pushing —
+# otherwise a restart would clobber any hook-set label (e.g. keyword topic) back
+# to the CLI name.
+
+CLI_SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+CLI_WATCH_INTERVAL_S = 2
+
+# sid → last-observed normalised CLI name. Separate from _session_labels so a
+# manual label set elsewhere never confuses the change-detection.
+_cli_name_cache: dict[str, str] = {}
+
+
+def _normalise_cli_name(raw: str) -> str:
+    parts = re.split(r'[ \t\n\r,;:()\[\]{}"|]+', raw)
+    tokens: list[str] = []
+    for p in parts:
+        cleaned = re.sub(r'[^a-zA-Z0-9-]', '', p)
+        if cleaned:
+            tokens.append(cleaned)
+        if len(tokens) >= 3:
+            break
+    if not tokens:
+        return ""
+    return "-".join(tokens).upper()[:12]
+
+
+async def _cli_name_watcher() -> None:
+    priming = True
+    while True:
+        try:
+            files = list(CLI_SESSIONS_DIR.glob("*.json"))
+        except OSError:
+            files = []
+        for f in files:
+            try:
+                d = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            sid = d.get("sessionId")
+            name = d.get("name")
+            if not sid or not name:
+                continue
+            normalised = _normalise_cli_name(name)
+            if not normalised:
+                continue
+            if _cli_name_cache.get(sid) == normalised:
+                continue
+            _cli_name_cache[sid] = normalised
+            if not priming:
+                log.info("cli-watcher: sid=%s /rename → %s", sid[:8], normalised)
+                await _set_session_state(sid, None, normalised)
+        priming = False
+        await asyncio.sleep(CLI_WATCH_INTERVAL_S)
 
 
 async def _push_time() -> None:
@@ -506,6 +584,19 @@ async def handle_theme(req: web.Request) -> web.Response:
     return web.Response(text=f"OK theme={name}\n")
 
 
+async def handle_snack(req: web.Request) -> web.Response:
+    """Force a snack break for visual iteration.
+    spec is 'kitkat'/'oreo'/'onigiri' (or 0/1/2)."""
+    spec = req.match_info.get("spec", "").lower()
+    table = {"kitkat": 0, "kit-kat": 0, "0": 0,
+             "oreo": 1, "1": 1,
+             "onigiri": 2, "2": 2}
+    if spec not in table:
+        return web.Response(status=400, text=f"unknown snack: {spec}\n")
+    await _send(f"snack {table[spec]}")
+    return web.Response(text=f"OK snack={spec}\n")
+
+
 async def handle_mug(req: web.Request) -> web.Response:
     """Force a specific cup design for visual iteration.
     Spec is `<brand>` (random form) or `<brand>-<form>` (ceramic|cup), or `auto`.
@@ -550,7 +641,11 @@ async def handle_emote(req: web.Request) -> web.Response:
                "thinking", "waiting", "done",
                "embarrassed", "smug", "focused", "scared", "mindblown",
                "dance",
-               "nod", "shake", "stretch"}
+               "nod", "shake", "stretch", "wobble", "flip",
+               "butterfly", "ball", "water", "kite",
+               "newspaper", "tea", "music",
+               "morse",
+               "bird", "snail", "ladybug"}
     if name not in allowed:
         return web.Response(status=400, text=f"unknown emote: {name}\n")
     await _send(f"emote {name}")
@@ -652,6 +747,7 @@ async def main() -> None:
     app.router.add_get("/emote/{name}", handle_emote)
     app.router.add_get("/weather/{code}", handle_weather)
     app.router.add_get("/mug/{spec}",     handle_mug)
+    app.router.add_get("/snack/{spec}",   handle_snack)
     app.router.add_get("/tool/{name}",  handle_tool)
     app.router.add_get("/tool",         handle_tool_clear)
     app.router.add_get("/time/{hh}",    handle_time)
@@ -666,6 +762,7 @@ async def main() -> None:
 
     asyncio.create_task(_hourly_time_pusher())
     asyncio.create_task(_session_evictor())
+    asyncio.create_task(_cli_name_watcher())
     asyncio.create_task(_weather_poller())
     asyncio.create_task(_health_check_loop())
     asyncio.create_task(_connect_loop())
