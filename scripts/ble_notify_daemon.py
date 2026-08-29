@@ -21,7 +21,9 @@ Side effects:
 import asyncio
 import json
 import logging
+import os
 import re
+import subprocess
 import sys
 import time
 from collections import deque
@@ -69,8 +71,8 @@ _last_bar_payload:    str = ""
 _last_face_state:     str = ""
 _last_labels_payload: str = ""
 SESSION_TTL_S = 30 * 60
-MAX_SLOTS     = 4
-LCD_WIDTH     = 128
+MAX_SLOTS     = 8   # firmware MAX_SESSIONS in waveshare-clawd/main/main.c
+LCD_WIDTH     = 240 # Waveshare 1.69" — was 128 for the old Atom target
 CHAR_PX_BIG   = 6      # 5x8 font + 1px spacing (used at 1-2 slots)
 CHAR_PX_TINY  = 4      # 3x5 font + 1px spacing (used at 3+ slots)
 SEG_PADDING   = 2      # divider + a hair of margin
@@ -215,8 +217,9 @@ def _build_bar_payload() -> str:
 
 
 def _chars_per_segment(n_slots: int) -> int:
-    """How many chars fit in one bar segment when n_slots share the 128px bar.
-    Mirrors firmware: 1-2 slots use 5x8 font, 3+ slots switch to the tiny 3x5."""
+    """How many chars fit in one bar segment when n_slots share the LCD width.
+    Mirrors firmware: 1-2 slots use 5x8 font, 3+ slots switch to the tiny 3x5.
+    Auto-sizes down as n_slots grows toward MAX_SLOTS (8)."""
     if n_slots < 1:
         return LABEL_HARD_MAX
     seg_w = LCD_WIDTH // n_slots
@@ -488,6 +491,134 @@ async def _weather_poller() -> None:
         await asyncio.sleep(WEATHER_POLL_S)
 
 
+# ─── Anthropic OAuth quota (drives Clawd's corner rings) ─────────────────────
+# GET /api/oauth/usage returns the same numbers claude.ai settings shows.
+# Auth: bearer OAuth token that Claude Code already stores locally. We try
+# an env override first (easy to seed from the browser DevTools once), then
+# fall back to macOS Keychain. Endpoint is undocumented but read-only and
+# unmetered.
+
+USAGE_POLL_S       = 120       # 2 min — the numbers only nudge each request
+USAGE_ENV_VAR      = "ANTHROPIC_OAUTH_TOKEN"
+USAGE_URL          = "https://api.anthropic.com/api/oauth/usage"
+USAGE_BETA_HEADER  = "oauth-2025-04-20"
+KEYCHAIN_SERVICE   = "Claude Code-credentials"
+KEYCHAIN_ACCOUNT   = "root"
+
+_last_usage: tuple[int, int] | None = None
+_logged_raw_usage = False
+
+
+def _read_oauth_token() -> str | None:
+    """Env var first, then Keychain. Returns None if neither works."""
+    env_tok = os.environ.get(USAGE_ENV_VAR, "").strip()
+    if env_tok:
+        return env_tok
+    try:
+        raw = subprocess.check_output(
+            ["security", "find-generic-password",
+             "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
+            stderr=subprocess.DEVNULL, timeout=3,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    # The blob may be a bare token, or JSON wrapping one. Try JSON first.
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw if raw else None
+    # Common shapes: {"claudeAiOauth":{"accessToken":"..."}} or {"accessToken":"..."}
+    for path in (("claudeAiOauth", "accessToken"),
+                 ("accessToken",),
+                 ("access_token",)):
+        cur = obj
+        ok = True
+        for key in path:
+            if isinstance(cur, dict) and key in cur:
+                cur = cur[key]
+            else:
+                ok = False
+                break
+        if ok and isinstance(cur, str) and cur:
+            return cur
+    return None
+
+
+def _extract_pct(node) -> int | None:
+    """Coerce a usage node into an integer 0..100. Handles float 0..1,
+    float 0..100, int, and {utilization|percent|value|used} wrappers."""
+    if node is None:
+        return None
+    if isinstance(node, (int, float)):
+        v = float(node)
+        if v <= 1.0:
+            v *= 100.0
+        return max(0, min(100, int(round(v))))
+    if isinstance(node, dict):
+        for key in ("utilization", "utilisation", "percent",
+                    "percent_used", "percentUsed", "used", "value"):
+            if key in node:
+                return _extract_pct(node[key])
+    return None
+
+
+async def _fetch_usage_once() -> tuple[int, int] | None:
+    """One /api/oauth/usage poll → (five_hour_pct, seven_day_pct), or None."""
+    global _logged_raw_usage
+    tok = _read_oauth_token()
+    if not tok:
+        return None
+    headers = {
+        "Authorization": f"Bearer {tok}",
+        "anthropic-beta": USAGE_BETA_HEADER,
+    }
+    try:
+        async with ClientSession(timeout=ClientTimeout(total=8)) as s:
+            async with s.get(USAGE_URL, headers=headers) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:200]
+                    log.warning("usage: HTTP %d — %s", resp.status, body)
+                    return None
+                data = await resp.json()
+    except Exception as exc:
+        log.warning("usage: fetch failed: %s", exc)
+        return None
+
+    # First successful response — dump raw so we can confirm the field shape.
+    if not _logged_raw_usage:
+        _logged_raw_usage = True
+        log.info("usage: first raw response keys=%s",
+                 list(data.keys()) if isinstance(data, dict) else type(data).__name__)
+        log.info("usage: full raw = %s", json.dumps(data, default=str)[:600])
+
+    five = _extract_pct(data.get("five_hour") if isinstance(data, dict) else None)
+    # For weekly, prefer the aggregate "all models" bucket; fall back to seven_day.
+    seven = None
+    if isinstance(data, dict):
+        for key in ("seven_day", "seven_day_all", "weekly", "seven_day_total"):
+            if key in data:
+                seven = _extract_pct(data[key])
+                if seven is not None:
+                    break
+    if five is None and seven is None:
+        return None
+    return (five if five is not None else -1,
+            seven if seven is not None else -1)
+
+
+async def _usage_poller() -> None:
+    """Poll /api/oauth/usage every 2 min; push `usage <5h> <7d>` on change."""
+    global _last_usage
+    await asyncio.sleep(20)   # let BLE settle before first push
+    while True:
+        pair = await _fetch_usage_once()
+        if pair is not None and pair != _last_usage:
+            _last_usage = pair
+            log.info("usage → 5h=%d%% 7d=%d%%", pair[0], pair[1])
+            await _send(f"usage {pair[0]} {pair[1]}")
+        await asyncio.sleep(USAGE_POLL_S)
+
+
 # ─── HTTP handlers ────────────────────────────────────────────────────────────
 
 def _sid(req: web.Request) -> str | None:
@@ -699,6 +830,22 @@ async def handle_tool_clear(req: web.Request) -> web.Response:
     return web.Response(text="OK tool=(clear)\n")
 
 
+async def handle_usage(req: web.Request) -> web.Response:
+    """Debug override: GET /usage/<5h>/<7d>. Force-pushes the ring values so
+    layout can be verified without waiting for the OAuth poller. Both args
+    are ints 0..100 (or -1 to blank a ring)."""
+    try:
+        a = int(req.match_info.get("a", ""))
+        b = int(req.match_info.get("b", ""))
+    except ValueError:
+        return web.Response(status=400, text="a and b must be ints -1..100\n")
+    for v in (a, b):
+        if v < -1 or v > 100:
+            return web.Response(status=400, text="a and b must be -1..100\n")
+    await _send(f"usage {a} {b}")
+    return web.Response(text=f"OK usage 5h={a}% 7d={b}%\n")
+
+
 async def handle_sessions(req: web.Request) -> web.Response:
     """Manual debug override: GET /sessions/<n>. Sends legacy `sessions <n>`
     plus a synthetic `bar` with n idle slots — useful for layout testing.
@@ -706,9 +853,9 @@ async def handle_sessions(req: web.Request) -> web.Response:
     try:
         n = int(req.match_info.get("n", ""))
     except ValueError:
-        return web.Response(status=400, text="n must be 0-4\n")
-    if n < 0 or n > 4:
-        return web.Response(status=400, text="n must be 0-4\n")
+        return web.Response(status=400, text=f"n must be 0-{MAX_SLOTS}\n")
+    if n < 0 or n > MAX_SLOTS:
+        return web.Response(status=400, text=f"n must be 0-{MAX_SLOTS}\n")
     await _send(f"sessions {n}")
     if n > 0:
         await _send(f"bar {'.' * n}")
@@ -752,6 +899,7 @@ async def main() -> None:
     app.router.add_get("/tool",         handle_tool_clear)
     app.router.add_get("/time/{hh}",    handle_time)
     app.router.add_get("/sessions/{n}", handle_sessions)
+    app.router.add_get("/usage/{a}/{b}", handle_usage)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -764,6 +912,7 @@ async def main() -> None:
     asyncio.create_task(_session_evictor())
     asyncio.create_task(_cli_name_watcher())
     asyncio.create_task(_weather_poller())
+    asyncio.create_task(_usage_poller())
     asyncio.create_task(_health_check_loop())
     asyncio.create_task(_connect_loop())
 
