@@ -23,7 +23,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 import time
 from collections import deque
@@ -53,6 +52,23 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Tiny .env loader — the daemon is spawned by a Claude Code hook, so it
+# doesn't inherit a shell that would source .env for us. Real env vars
+# still win over file entries (setdefault semantics).
+def _load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = v.strip().strip('"').strip("'")
+        os.environ.setdefault(k.strip(), v)
+
+_load_env_file(Path(__file__).parent / ".env")            # scripts/.env
+_load_env_file(Path(__file__).parent.parent / ".env")     # repo-root .env
+
 _client: BleakClient | None = None
 _loop:   asyncio.AbstractEventLoop | None = None
 _thinking_history: deque = deque()
@@ -67,6 +83,7 @@ _session_seen:   dict[str, float] = {}
 _session_states: dict[str, str]   = {}
 _session_slots:  dict[str, int]   = {}
 _session_labels: dict[str, str]   = {}
+_session_cli_pid: dict[str, int]  = {}   # daemon sid → Claude CLI PID (from hook PPID walk)
 _last_bar_payload:    str = ""
 _last_face_state:     str = ""
 _last_labels_payload: str = ""
@@ -190,6 +207,7 @@ def _evict_old_sessions() -> None:
         _session_states.pop(sid, None)
         _session_slots.pop(sid, None)
         _session_labels.pop(sid, None)
+        _session_cli_pid.pop(sid, None)
 
 
 def _alloc_slot(sid: str) -> int | None:
@@ -293,15 +311,28 @@ async def _set_session_state(
     session_id: str | None,
     state: str | None,
     label: str | None = None,
+    cli_pid: int | None = None,
 ) -> None:
     """Mark a session as seen and (optionally) update its bar state and label.
     state in {'T','W','D', None}; None just refreshes the seen-time (e.g. /tool).
-    label is a short repo/cwd name (5 chars max). Broadcasts if anything changed."""
+    label is a short repo/cwd name (5 chars max). cli_pid links this session
+    to a Claude Code CLI PID for /rename mirroring (from PPID walk in the hook).
+    Broadcasts if anything changed."""
     if session_id:
         _session_seen[session_id] = time.monotonic()
+        if cli_pid:
+            _session_cli_pid[session_id] = cli_pid
         if state is not None:
             _alloc_slot(session_id)
             _session_states[session_id] = state
+        # If the CLI has /renamed this session, prefer that name over the
+        # hook's cwd-derived label — otherwise every hook would revert the
+        # rename and fight with the watcher, causing labelswap ping-pong.
+        pid_for_label = cli_pid or _session_cli_pid.get(session_id)
+        if pid_for_label:
+            rename_name = _cli_name_cache.get(f"pid::{pid_for_label}")
+            if rename_name:
+                label = rename_name
         if label:
             new_label = label[:LABEL_HARD_MAX]
             prev_label = _session_labels.get(session_id, "")
@@ -364,6 +395,10 @@ def _normalise_cli_name(raw: str) -> str:
 
 
 async def _cli_name_watcher() -> None:
+    """Poll ~/.claude/sessions/<pid>.json for /rename events and mirror them
+    to Clawd. Matching uses the CLI's PID (which is the file stem) linked to
+    the hook's PPID walk — unambiguous even when multiple Claude Codes share
+    a cwd."""
     priming = True
     while True:
         try:
@@ -372,22 +407,39 @@ async def _cli_name_watcher() -> None:
             files = []
         for f in files:
             try:
+                cli_pid = int(f.stem)   # file name is the PID
+            except ValueError:
+                continue
+            try:
                 d = json.loads(f.read_text())
             except (OSError, ValueError):
                 continue
-            sid = d.get("sessionId")
             name = d.get("name")
-            if not sid or not name:
+            if not name:
                 continue
             normalised = _normalise_cli_name(name)
             if not normalised:
                 continue
-            if _cli_name_cache.get(sid) == normalised:
+            cache_key = f"pid::{cli_pid}"
+            first_time = (_cli_name_cache.get(cache_key) != normalised)
+            _cli_name_cache[cache_key] = normalised
+            if priming:
                 continue
-            _cli_name_cache[sid] = normalised
-            if not priming:
-                log.info("cli-watcher: sid=%s /rename → %s", sid[:8], normalised)
-                await _set_session_state(sid, None, normalised)
+            # Find daemon sessions the hook has linked to this CLI PID AND
+            # that aren't already showing the target label.
+            matched = [sid for sid, pid in _session_cli_pid.items()
+                       if pid == cli_pid
+                       and _session_labels.get(sid) != normalised]
+            if not matched:
+                if first_time:
+                    log.info("cli-watcher: /rename → %s (pid=%d) — no hook "
+                             "has linked a daemon session to that PID yet",
+                             normalised, cli_pid)
+                continue
+            log.info("cli-watcher: /rename → %s applied to %d session(s) "
+                     "(pid=%d)", normalised, len(matched), cli_pid)
+            for daemon_sid in matched:
+                await _set_session_state(daemon_sid, None, normalised)
         priming = False
         await asyncio.sleep(CLI_WATCH_INTERVAL_S)
 
@@ -491,132 +543,12 @@ async def _weather_poller() -> None:
         await asyncio.sleep(WEATHER_POLL_S)
 
 
-# ─── Anthropic OAuth quota (drives Clawd's corner rings) ─────────────────────
-# GET /api/oauth/usage returns the same numbers claude.ai settings shows.
-# Auth: bearer OAuth token that Claude Code already stores locally. We try
-# an env override first (easy to seed from the browser DevTools once), then
-# fall back to macOS Keychain. Endpoint is undocumented but read-only and
-# unmetered.
-
-USAGE_POLL_S       = 120       # 2 min — the numbers only nudge each request
-USAGE_ENV_VAR      = "ANTHROPIC_OAUTH_TOKEN"
-USAGE_URL          = "https://api.anthropic.com/api/oauth/usage"
-USAGE_BETA_HEADER  = "oauth-2025-04-20"
-KEYCHAIN_SERVICE   = "Claude Code-credentials"
-KEYCHAIN_ACCOUNT   = "root"
-
-_last_usage: tuple[int, int] | None = None
-_logged_raw_usage = False
-
-
-def _read_oauth_token() -> str | None:
-    """Env var first, then Keychain. Returns None if neither works."""
-    env_tok = os.environ.get(USAGE_ENV_VAR, "").strip()
-    if env_tok:
-        return env_tok
-    try:
-        raw = subprocess.check_output(
-            ["security", "find-generic-password",
-             "-s", KEYCHAIN_SERVICE, "-a", KEYCHAIN_ACCOUNT, "-w"],
-            stderr=subprocess.DEVNULL, timeout=3,
-        ).decode().strip()
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-    # The blob may be a bare token, or JSON wrapping one. Try JSON first.
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return raw if raw else None
-    # Common shapes: {"claudeAiOauth":{"accessToken":"..."}} or {"accessToken":"..."}
-    for path in (("claudeAiOauth", "accessToken"),
-                 ("accessToken",),
-                 ("access_token",)):
-        cur = obj
-        ok = True
-        for key in path:
-            if isinstance(cur, dict) and key in cur:
-                cur = cur[key]
-            else:
-                ok = False
-                break
-        if ok and isinstance(cur, str) and cur:
-            return cur
-    return None
-
-
-def _extract_pct(node) -> int | None:
-    """Coerce a usage node into an integer 0..100. Handles float 0..1,
-    float 0..100, int, and {utilization|percent|value|used} wrappers."""
-    if node is None:
-        return None
-    if isinstance(node, (int, float)):
-        v = float(node)
-        if v <= 1.0:
-            v *= 100.0
-        return max(0, min(100, int(round(v))))
-    if isinstance(node, dict):
-        for key in ("utilization", "utilisation", "percent",
-                    "percent_used", "percentUsed", "used", "value"):
-            if key in node:
-                return _extract_pct(node[key])
-    return None
-
-
-async def _fetch_usage_once() -> tuple[int, int] | None:
-    """One /api/oauth/usage poll → (five_hour_pct, seven_day_pct), or None."""
-    global _logged_raw_usage
-    tok = _read_oauth_token()
-    if not tok:
-        return None
-    headers = {
-        "Authorization": f"Bearer {tok}",
-        "anthropic-beta": USAGE_BETA_HEADER,
-    }
-    try:
-        async with ClientSession(timeout=ClientTimeout(total=8)) as s:
-            async with s.get(USAGE_URL, headers=headers) as resp:
-                if resp.status != 200:
-                    body = (await resp.text())[:200]
-                    log.warning("usage: HTTP %d — %s", resp.status, body)
-                    return None
-                data = await resp.json()
-    except Exception as exc:
-        log.warning("usage: fetch failed: %s", exc)
-        return None
-
-    # First successful response — dump raw so we can confirm the field shape.
-    if not _logged_raw_usage:
-        _logged_raw_usage = True
-        log.info("usage: first raw response keys=%s",
-                 list(data.keys()) if isinstance(data, dict) else type(data).__name__)
-        log.info("usage: full raw = %s", json.dumps(data, default=str)[:600])
-
-    five = _extract_pct(data.get("five_hour") if isinstance(data, dict) else None)
-    # For weekly, prefer the aggregate "all models" bucket; fall back to seven_day.
-    seven = None
-    if isinstance(data, dict):
-        for key in ("seven_day", "seven_day_all", "weekly", "seven_day_total"):
-            if key in data:
-                seven = _extract_pct(data[key])
-                if seven is not None:
-                    break
-    if five is None and seven is None:
-        return None
-    return (five if five is not None else -1,
-            seven if seven is not None else -1)
-
-
-async def _usage_poller() -> None:
-    """Poll /api/oauth/usage every 2 min; push `usage <5h> <7d>` on change."""
-    global _last_usage
-    await asyncio.sleep(20)   # let BLE settle before first push
-    while True:
-        pair = await _fetch_usage_once()
-        if pair is not None and pair != _last_usage:
-            _last_usage = pair
-            log.info("usage → 5h=%d%% 7d=%d%%", pair[0], pair[1])
-            await _send(f"usage {pair[0]} {pair[1]}")
-        await asyncio.sleep(USAGE_POLL_S)
+# ─── Anthropic quota (drives Clawd's corner rings) ───────────────────────────
+# Removed: covert scrape of claude.ai/api/organizations/{id}/usage with a
+# session cookie. Fragile (cookie rotates + Cloudflare gating) and off — that
+# endpoint isn't published. Ring values are set manually via the debug endpoint
+# `GET /usage/{a}/{b}` for now. A local-JSONL parser (ccusage-style) is a
+# candidate for a real automated feed later.
 
 
 # ─── HTTP handlers ────────────────────────────────────────────────────────────
@@ -636,6 +568,15 @@ def _label(req: web.Request) -> str | None:
     return clean if clean else None
 
 
+def _cli_pid(req: web.Request) -> int | None:
+    """Pull CLI PID from query (set by the hook's PPID walk). Empty/invalid → None."""
+    raw = req.query.get("cli_pid", "").strip()
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
 async def handle_thinking(req: web.Request) -> web.Response:
     global _last_dizzy_ts
     sid = _sid(req)
@@ -651,28 +592,28 @@ async def handle_thinking(req: web.Request) -> web.Response:
         _thinking_history.clear()
         log.info("rapid-fire detected → dizzy")
         # Still update bar state so it's accurate after dizzy clears.
-        await _set_session_state(sid, "T", _label(req))
+        await _set_session_state(sid, "T", _label(req), _cli_pid(req))
         await _send("dizzy")
         return web.Response(text="OK (dizzy)\n")
 
-    await _set_session_state(sid, "T", _label(req))
+    await _set_session_state(sid, "T", _label(req), _cli_pid(req))
     return web.Response(text="OK\n")
 
 
 async def handle_question(req: web.Request) -> web.Response:
-    await _set_session_state(_sid(req), "W", _label(req))
+    await _set_session_state(_sid(req), "W", _label(req), _cli_pid(req))
     return web.Response(text="OK\n")
 
 
 async def handle_notify(req: web.Request) -> web.Response:
-    await _set_session_state(_sid(req), "D", _label(req))
+    await _set_session_state(_sid(req), "D", _label(req), _cli_pid(req))
     return web.Response(text="OK\n")
 
 
 async def handle_clear(req: web.Request) -> web.Response:
     # Manual override — forces face to standby without touching per-session state.
     # (Per-session state is still refreshed via the seen-time path.)
-    await _set_session_state(_sid(req), None, _label(req))
+    await _set_session_state(_sid(req), None, _label(req), _cli_pid(req))
     await _send("standby")
     return web.Response(text="OK\n")
 
@@ -807,7 +748,7 @@ _TOOL_ALIAS = {
 async def handle_tool(req: web.Request) -> web.Response:
     # Tool calls just refresh seen-time; they don't change the bar state.
     sid = _sid(req)
-    await _set_session_state(sid, None, _label(req))
+    await _set_session_state(sid, None, _label(req), _cli_pid(req))
     name = req.match_info.get("name", "").strip().lower()
     if not name:
         await _send("tool")  # clear
@@ -825,7 +766,7 @@ async def handle_tool(req: web.Request) -> web.Response:
 
 
 async def handle_tool_clear(req: web.Request) -> web.Response:
-    await _set_session_state(_sid(req), None, _label(req))
+    await _set_session_state(_sid(req), None, _label(req), _cli_pid(req))
     await _send("tool")
     return web.Response(text="OK tool=(clear)\n")
 
@@ -912,7 +853,6 @@ async def main() -> None:
     asyncio.create_task(_session_evictor())
     asyncio.create_task(_cli_name_watcher())
     asyncio.create_task(_weather_poller())
-    asyncio.create_task(_usage_poller())
     asyncio.create_task(_health_check_loop())
     asyncio.create_task(_connect_loop())
 

@@ -68,11 +68,11 @@ Add to `~/.claude/settings.json`:
 ```json
 {
   "hooks": {
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/path/to/atoms3r_ble_notify/scripts/ble_notify_hook.sh thinking"}]}],
-    "Notification":     [{"hooks": [{"type": "command", "command": "/path/to/atoms3r_ble_notify/scripts/ble_notify_hook.sh question"}]}],
-    "PreToolUse":       [{"hooks": [{"type": "command", "command": "/path/to/atoms3r_ble_notify/scripts/ble_notify_hook.sh tool"}]}],
-    "PostToolUse":      [{"hooks": [{"type": "command", "command": "/path/to/atoms3r_ble_notify/scripts/ble_notify_hook.sh thinking && /path/to/atoms3r_ble_notify/scripts/ble_notify_hook.sh tool-clear"}]}],
-    "Stop":             [{"hooks": [{"type": "command", "command": "/path/to/atoms3r_ble_notify/scripts/ble_notify_hook.sh notify"}]}]
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/path/to/clawd-daemon/scripts/ble_notify_hook.sh thinking"}]}],
+    "Notification":     [{"hooks": [{"type": "command", "command": "/path/to/clawd-daemon/scripts/ble_notify_hook.sh question"}]}],
+    "PreToolUse":       [{"hooks": [{"type": "command", "command": "/path/to/clawd-daemon/scripts/ble_notify_hook.sh tool"}]}],
+    "PostToolUse":      [{"hooks": [{"type": "command", "command": "/path/to/clawd-daemon/scripts/ble_notify_hook.sh thinking && /path/to/clawd-daemon/scripts/ble_notify_hook.sh tool-clear"}]}],
+    "Stop":             [{"hooks": [{"type": "command", "command": "/path/to/clawd-daemon/scripts/ble_notify_hook.sh notify"}]}]
   }
 }
 ```

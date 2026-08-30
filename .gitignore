@@ -5,3 +5,10 @@ dependencies.lock
 main/secrets.h
 sdkconfig
 sdkconfig.old
+
+# Local env for the Python daemon (holds ANTHROPIC_OAUTH_TOKEN)
+.env
+scripts/.env
+
+# macOS junk
+.DS_Store

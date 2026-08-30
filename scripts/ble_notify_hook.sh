@@ -24,6 +24,25 @@ CWD=$(printf '%s' "$J" | jq -r '.cwd // empty' 2>/dev/null || true)
 [ -z "$CWD" ] && CWD="$PWD"
 DEFAULT_LABEL=$(basename "$CWD" | tr -cd 'A-Za-z0-9_ -')
 
+# Walk PPID chain to find the Claude Code CLI's PID — the ancestor whose
+# ~/.claude/sessions/<pid>.json file exists. Lets the daemon link this
+# hook's session_id to the CLI's .name for /rename mirroring, even when
+# multiple CLI instances share the same cwd.
+find_cli_pid() {
+    local p=$$
+    local i=0
+    while [ $i -lt 10 ] && [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ]; do
+        p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+        [ -z "$p" ] && break
+        if [ -f "$HOME/.claude/sessions/$p.json" ]; then
+            echo "$p"
+            return
+        fi
+        i=$((i + 1))
+    done
+}
+CLI_PID=$(find_cli_pid)
+
 TOPIC_FILE=""
 [ -n "$S" ] && TOPIC_FILE="/tmp/clawd_topic.$S"
 
@@ -233,6 +252,7 @@ if [ -n "$S" ]; then
     curl -s -G --max-time 2 \
         --data-urlencode "session_id=$S" \
         --data-urlencode "label=$LABEL" \
+        --data-urlencode "cli_pid=${CLI_PID:-}" \
         "$URL" > /dev/null 2>&1 || true
 else
     curl -s --max-time 2 "$URL" > /dev/null 2>&1 || true
